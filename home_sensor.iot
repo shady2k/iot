@@ -1,0 +1,424 @@
+//#define DEVMODE 1
+
+#include <Wire.h>
+#include <BH1750.h>
+#include <PubSubClient.h>
+#include <ESP8266WiFi.h>
+
+#define BME280_ADDRESS 0x76
+#define HOSTNAME "WemosD1-1"
+
+BH1750 lightMeter;
+
+// Replace with your network details
+const char* ssid = "";
+const char* password = "";
+const char* mqtt_server = "";
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+unsigned long int hum_raw,temp_raw,pres_raw;
+signed long int t_fine;
+int led = 13;
+byte gradus[8] =
+{
+B00111,
+B00101,
+B00111,
+B00000,
+B00000,
+B00000,
+B00000,
+};
+uint16_t dig_T1;
+int16_t dig_T2;
+int16_t dig_T3;
+uint16_t dig_P1;
+int16_t dig_P2;
+int16_t dig_P3;
+int16_t dig_P4;
+int16_t dig_P5;
+int16_t dig_P6;
+int16_t dig_P7;
+int16_t dig_P8;
+int16_t dig_P9;
+int8_t dig_H1;
+int16_t dig_H2;
+int8_t dig_H3;
+int16_t dig_H4;
+int16_t dig_H5;
+int8_t dig_H6;
+
+const int soundPin = A0; //sound sensor attach to A0
+
+long lastMsgLux = 0;
+long lastMsgTemp = 0;
+
+long lastMsgNoise = 10;
+long lastValueNoise = 0;
+float averageValueNoise = 0;
+
+static char lux_str[7];
+static char temp_str[7];
+static char press_str[7];
+static char humidity_str[7];
+static char sound_str[7];
+
+void setup() {
+  pinMode(led,OUTPUT);
+  digitalWrite (led, LOW);
+  uint8_t osrs_t = 1; //Temperature oversampling x 1
+  uint8_t osrs_p = 1; //Pressure oversampling x 1
+  uint8_t osrs_h = 1; //Humidity oversampling x 1
+  uint8_t mode = 3; //Normal mode
+  uint8_t t_sb = 5; //Tstandby 1000ms
+  uint8_t filter = 0; //Filter off
+  uint8_t spi3w_en = 0; //3-wire SPI Disable
+  
+  uint8_t ctrl_meas_reg = (osrs_t << 5) | (osrs_p << 2) | mode;
+  uint8_t config_reg = (t_sb << 5) | (filter << 2) | spi3w_en;
+  uint8_t ctrl_hum_reg = osrs_h;
+  
+  #if defined(DEVMODE)
+    // Initializing serial port for debugging purposes
+    Serial.begin(115200);
+  #endif
+
+  // Start wifi
+  setup_wifi();
+
+  // start mqtt
+  mqtt_client.setServer(mqtt_server, 1883);
+  
+  lightMeter.begin();
+  Wire.begin();
+  writeReg(0xF2,ctrl_hum_reg);
+  writeReg(0xF4,ctrl_meas_reg);
+  writeReg(0xF5,config_reg);
+  readTrim();
+}
+
+void lux() {
+  uint16_t lux = lightMeter.readLightLevel();
+  #if defined(DEVMODE)
+    Serial.print("Light: ");
+    Serial.print(lux);
+    Serial.println(" lx");
+  #endif
+
+  dtostrf(lux, 4, 0, lux_str);
+  trim(lux_str);
+  
+  mqtt_client.publish("myhome/out/sensor/hall/light", lux_str);
+}
+
+void temp() {
+  double temp_act = 0, press_act = 0,hum_act=0;
+  signed long int temp_cal;
+  unsigned long int press_cal,hum_cal;
+  
+  readData();
+  temp_cal = calibration_T(temp_raw);
+  press_cal = calibration_P(pres_raw);
+  hum_cal = calibration_H(hum_raw);
+  temp_act = (double)temp_cal / 100.0;
+  press_act = (double)press_cal / 133.3;
+  hum_act = (double)hum_cal / 1024.0;
+  
+  #if defined(DEVMODE)
+    Serial.print("Humidi: ");
+    Serial.print(hum_act);
+    Serial.print(" % | ");
+    
+    Serial.print("Pressure: ");
+    Serial.print(press_act);
+    Serial.print(" mm | ");
+    
+    Serial.print("Temp: ");
+    Serial.print(temp_act);
+    Serial.println(" *C");
+  #endif
+
+  dtostrf(temp_act, 6, 2, temp_str);
+  dtostrf(hum_act, 6, 2, humidity_str);
+  dtostrf(press_act, 6, 2, press_str);
+
+  trim(temp_str);
+  trim(humidity_str);
+  trim(press_str);
+
+  mqtt_client.publish("myhome/out/sensor/hall/temperature", temp_str);
+  mqtt_client.publish("myhome/out/sensor/hall/humidity", humidity_str);
+  mqtt_client.publish("myhome/out/sensor/hall/pressure", press_str);
+}
+
+void sound() {
+  #if defined(DEVMODE)
+    Serial.print("averageValueNoise: ");
+    Serial.println(averageValueNoise);
+    
+  if(averageValueNoise < 30 && lastValueNoise != 0) {
+    Serial.print("Очень тихо ");//print the value
+    Serial.println(averageValueNoise);//print the value
+    lastValueNoise = 0;
+  }
+
+  if(averageValueNoise >= 30 && averageValueNoise < 40 && lastValueNoise != 1) {
+    Serial.print("Тихо ");//print the value
+    Serial.println(averageValueNoise);//print the value
+    lastValueNoise = 1;
+  }
+
+  if(averageValueNoise >= 40 && averageValueNoise < 80 && lastValueNoise != 2) {
+    Serial.print("Шумно ");//print the value
+    Serial.println(averageValueNoise);//print the value
+    lastValueNoise = 2;
+  }
+
+  if(averageValueNoise >= 80 && lastValueNoise != 3) {
+    Serial.print("Громко ");//print the value
+    Serial.println(averageValueNoise);//print the value
+    lastValueNoise = 3;
+  }
+  #endif
+
+  dtostrf(averageValueNoise, 6, 2, sound_str);
+  trim(sound_str);
+
+  mqtt_client.publish("myhome/out/sensor/hall/sound", sound_str);
+}
+
+void loop()
+{
+
+  if (WiFi.status() != WL_CONNECTED) {  //wifi not connected?
+    #if defined(DEVMODE)
+      Serial.print("Connection lost, trying to connect...");
+    #endif
+    
+    setup_wifi();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqtt_client.connected()) {
+      reconnect();
+    }
+    mqtt_client.loop();
+  
+    long now = millis();
+
+    int value = analogRead(soundPin);//read the value of A0
+    Serial.println(value);
+    averageValueNoise = averageValueNoise * 0.95 + value * 0.05;
+    delay(100);
+  
+    if (now - lastMsgNoise > 24000) {
+      sound();
+      averageValueNoise = 0;
+      lastMsgNoise = now;
+    }
+  
+    if (now - lastMsgTemp > 25000) {
+      temp();
+      lastMsgTemp = now;
+    }
+  
+    if (now - lastMsgLux > 23000) {
+      lux();
+      lastMsgLux = now;
+    }
+
+  }
+}
+
+//mqtt
+void reconnect() {
+  // Loop until we're reconnected
+  while (!mqtt_client.connected()) {
+    #if defined(DEVMODE)
+      Serial.print("Attempting MQTT connection...");
+    #endif
+    // Create a random client ID
+    String clientId = HOSTNAME;
+    // Attempt to connect
+    if (mqtt_client.connect(clientId.c_str())) {
+      #if defined(DEVMODE)
+        Serial.println("connected");
+      #endif
+      // Once connected, publish an announcement...
+      //mqtt_client.publish("outTopic", "hello world");
+      // ... and resubscribe
+      //mqtt_client.subscribe("inTopic");
+    } else {
+      #if defined(DEVMODE)
+        Serial.print("failed, rc=");
+        Serial.print(mqtt_client.state());
+        Serial.println(" try again in 5 seconds");
+      #endif
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void setup_wifi() {
+  // We start by connecting to a WiFi network
+  #if defined(DEVMODE)
+    Serial.println();
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+  #endif
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(HOSTNAME);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    #if defined(DEVMODE)
+      Serial.print(".");
+    #endif
+  }
+
+  #if defined(DEVMODE)
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  #endif
+}
+
+void trim(char* _str) {
+  while( (strlen(_str) > 0) && (_str[0] == 32) )
+  {
+     strcpy(_str,&_str[1]);
+  }
+
+  while( (strlen(_str) > 0) && (_str[strlen(_str) - 1] == 32) )
+  {
+    _str[strlen(_str) - 1] = 0;
+  }  
+}
+
+void readTrim() {
+  uint8_t data[32],i=0; // Fix 2014/04/06
+  Wire.beginTransmission(BME280_ADDRESS);
+  Wire.write(0x88);
+  Wire.endTransmission();
+  Wire.requestFrom(BME280_ADDRESS,24); // Fix 2014/04/06
+  while(Wire.available()) {
+    data[i] = Wire.read();
+    i++;
+  }
+
+  Wire.beginTransmission(BME280_ADDRESS); // Add 2014/04/06
+  Wire.write(0xA1); // Add 2014/04/06
+  Wire.endTransmission(); // Add 2014/04/06
+  Wire.requestFrom(BME280_ADDRESS,1); // Add 2014/04/06
+  data[i] = Wire.read(); // Add 2014/04/06
+  i++; // Add 2014/04/06
+  
+  Wire.beginTransmission(BME280_ADDRESS);
+  Wire.write(0xE1);
+  Wire.endTransmission();
+  Wire.requestFrom(BME280_ADDRESS,7); // Fix 2014/04/06
+  while(Wire.available()) {
+    data[i] = Wire.read();
+    i++;
+  }
+  
+  dig_T1 = (data[1] << 8) | data[0];
+  dig_T2 = (data[3] << 8) | data[2];
+  dig_T3 = (data[5] << 8) | data[4];
+  dig_P1 = (data[7] << 8) | data[6];
+  dig_P2 = (data[9] << 8) | data[8];
+  dig_P3 = (data[11]<< 8) | data[10];
+  dig_P4 = (data[13]<< 8) | data[12];
+  dig_P5 = (data[15]<< 8) | data[14];
+  dig_P6 = (data[17]<< 8) | data[16];
+  dig_P7 = (data[19]<< 8) | data[18];
+  dig_P8 = (data[21]<< 8) | data[20];
+  dig_P9 = (data[23]<< 8) | data[22];
+  dig_H1 = data[24];
+  dig_H2 = (data[26]<< 8) | data[25];
+  dig_H3 = data[27];
+  dig_H4 = (data[28]<< 4) | (0x0F & data[29]);
+  dig_H5 = (data[30] << 4) | ((data[29] >> 4) & 0x0F); // Fix 2014/04/06
+  dig_H6 = data[31]; // Fix 2014/04/06
+}
+
+void writeReg(uint8_t reg_address, uint8_t data) {
+  Wire.beginTransmission(BME280_ADDRESS);
+  Wire.write(reg_address);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+void readData() {
+  int i = 0;
+  uint32_t data[8];
+  Wire.beginTransmission(BME280_ADDRESS);
+  Wire.write(0xF7);
+  Wire.endTransmission();
+  Wire.requestFrom(BME280_ADDRESS,8);
+  while(Wire.available()){
+    data[i] = Wire.read();
+    i++;
+  }
+  pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4);
+  temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4);
+  hum_raw = (data[6] << 8) | data[7];
+}
+
+signed long int calibration_T(signed long int adc_T) {
+  signed long int var1, var2, T;
+  var1 = ((((adc_T >> 3) - ((signed long int)dig_T1<<1))) * ((signed long int)dig_T2)) >> 11;
+  var2 = (((((adc_T >> 4) - ((signed long int)dig_T1)) * ((adc_T>>4) - ((signed long int)dig_T1))) >> 12) * ((signed long int)dig_T3)) >> 14;
+  
+  t_fine = var1 + var2;
+  T = (t_fine * 5 + 128) >> 8;
+  return T;
+}
+
+unsigned long int calibration_P(signed long int adc_P) {
+  signed long int var1, var2;
+  unsigned long int P;
+  var1 = (((signed long int)t_fine)>>1) - (signed long int)64000;
+  var2 = (((var1>>2) * (var1>>2)) >> 11) * ((signed long int)dig_P6);
+  var2 = var2 + ((var1*((signed long int)dig_P5))<<1);
+  var2 = (var2>>2)+(((signed long int)dig_P4)<<16);
+  var1 = (((dig_P3 * (((var1>>2)*(var1>>2)) >> 13)) >>3) + ((((signed long int)dig_P2) * var1)>>1))>>18;
+  var1 = ((((32768+var1))*((signed long int)dig_P1))>>15);
+  if (var1 == 0)
+  {
+    return 0;
+  }
+  P = (((unsigned long int)(((signed long int)1048576)-adc_P)-(var2>>12)))*3125;
+  if(P<0x80000000)
+  {
+    P = (P << 1) / ((unsigned long int) var1);
+  }
+  else
+  {
+    P = (P / (unsigned long int)var1) * 2;
+  }
+  var1 = (((signed long int)dig_P9) * ((signed long int)(((P>>3) * (P>>3))>>13)))>>12;
+  var2 = (((signed long int)(P>>2)) * ((signed long int)dig_P8))>>13;
+  P = (unsigned long int)((signed long int)P + ((var1 + var2 + dig_P7) >> 4));
+  return P;
+}
+
+unsigned long int calibration_H(signed long int adc_H) {
+  signed long int v_x1;
+  
+  v_x1 = (t_fine - ((signed long int)76800));
+  v_x1 = (((((adc_H << 14) -(((signed long int)dig_H4) << 20) - (((signed long int)dig_H5) * v_x1)) +
+  ((signed long int)16384)) >> 15) * (((((((v_x1 * ((signed long int)dig_H6)) >> 10) *
+  (((v_x1 * ((signed long int)dig_H3)) >> 11) + ((signed long int) 32768))) >> 10) + (( signed long int)2097152)) *
+  ((signed long int) dig_H2) + 8192) >> 14));
+  v_x1 = (v_x1 - (((((v_x1 >> 15) * (v_x1 >> 15)) >> 7) * ((signed long int)dig_H1)) >> 4));
+  v_x1 = (v_x1 < 0 ? 0 : v_x1);
+  v_x1 = (v_x1 > 419430400 ? 419430400 : v_x1);
+  return (unsigned long int)(v_x1 >> 12);
+}
