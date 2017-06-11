@@ -4,9 +4,10 @@
 #include <BH1750.h>
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>;
 
-#define BME280_ADDRESS 0x76
 #define HOSTNAME "WemosD1-1"
+#define BME280_ADDRESS 0x76
 
 BH1750 lightMeter;
 
@@ -14,6 +15,11 @@ BH1750 lightMeter;
 const char* ssid = "";
 const char* password = "";
 const char* mqtt_server = "";
+
+// CO2
+SoftwareSerial mySerial(D3, D4); // D3 - к TX сенсора, D4 - к RX
+byte cmd[9] = {0xFF,0x01,0x86,0x00,0x00,0x00,0x00,0x00,0x79}; 
+unsigned char response[9];
 
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
@@ -54,7 +60,7 @@ const int soundPin = A0; //sound sensor attach to A0
 
 long lastMsgLux = 0;
 long lastMsgTemp = 0;
-
+long lastMsgCO2 = 0;
 long lastMsgNoise = 10;
 long lastValueNoise = 0;
 float averageValueNoise = 0;
@@ -64,9 +70,16 @@ static char temp_str[7];
 static char press_str[7];
 static char humidity_str[7];
 static char sound_str[7];
+static char ppm_str[7];
 
 void setup() {
-  pinMode(led,OUTPUT);
+
+  #if defined(DEVMODE)
+    // Initializing serial port for debugging purposes
+    Serial.begin(9600);
+  #endif
+  
+  pinMode(led, OUTPUT);
   digitalWrite (led, LOW);
   uint8_t osrs_t = 1; //Temperature oversampling x 1
   uint8_t osrs_p = 1; //Pressure oversampling x 1
@@ -80,11 +93,6 @@ void setup() {
   uint8_t config_reg = (t_sb << 5) | (filter << 2) | spi3w_en;
   uint8_t ctrl_hum_reg = osrs_h;
   
-  #if defined(DEVMODE)
-    // Initializing serial port for debugging purposes
-    Serial.begin(115200);
-  #endif
-
   // Start wifi
   setup_wifi();
 
@@ -97,6 +105,40 @@ void setup() {
   writeReg(0xF4,ctrl_meas_reg);
   writeReg(0xF5,config_reg);
   readTrim();
+
+  mySerial.begin(9600);
+  mySerial.flush();
+}
+
+void co2() {
+  String str = "";
+  
+  mySerial.write(cmd, 9);
+  memset(response, 0, 9);
+  mySerial.readBytes(response, 9);
+  int i;
+  byte crc = 0;
+  for (i = 1; i < 8; i++) crc+=response[i];
+  crc = 255 - crc;
+  crc++;
+
+  if ( !(response[0] == 0xFF && response[1] == 0x86 && response[8] == crc) ) {
+    #if defined(DEVMODE)
+      Serial.println("CRC error: " + String(crc) + " / "+ String(response[8]));
+    #endif
+  } else {
+    unsigned int responseHigh = (unsigned int) response[2];
+    unsigned int responseLow = (unsigned int) response[3];
+    unsigned int ppm = (256*responseHigh) + responseLow;
+    #if defined(DEVMODE)
+      Serial.print("CO2: ");
+      Serial.println(ppm);
+    #endif
+
+    str=String(ppm);
+    str.toCharArray(ppm_str, 6);
+    mqtt_client.publish("myhome/out/sensor2/hall/co2", ppm_str);
+  }
 }
 
 void lux() {
@@ -110,13 +152,13 @@ void lux() {
   dtostrf(lux, 4, 0, lux_str);
   trim(lux_str);
   
-  mqtt_client.publish("myhome/out/sensor/hall/light", lux_str);
+  mqtt_client.publish("myhome/out/sensor2/hall/light", lux_str);
 }
 
 void temp() {
-  double temp_act = 0, press_act = 0,hum_act=0;
+  double temp_act = 0, press_act = 0, hum_act=0;
   signed long int temp_cal;
-  unsigned long int press_cal,hum_cal;
+  unsigned long int press_cal, hum_cal;
   
   readData();
   temp_cal = calibration_T(temp_raw);
@@ -148,9 +190,9 @@ void temp() {
   trim(humidity_str);
   trim(press_str);
 
-  mqtt_client.publish("myhome/out/sensor/hall/temperature", temp_str);
-  mqtt_client.publish("myhome/out/sensor/hall/humidity", humidity_str);
-  mqtt_client.publish("myhome/out/sensor/hall/pressure", press_str);
+  mqtt_client.publish("myhome/out/sensor2/hall/temperature", temp_str);
+  mqtt_client.publish("myhome/out/sensor2/hall/humidity", humidity_str);
+  mqtt_client.publish("myhome/out/sensor2/hall/pressure", press_str);
 }
 
 void sound() {
@@ -186,7 +228,7 @@ void sound() {
   dtostrf(averageValueNoise, 6, 2, sound_str);
   trim(sound_str);
 
-  mqtt_client.publish("myhome/out/sensor/hall/sound", sound_str);
+  mqtt_client.publish("myhome/out/sensor2/hall/sound", sound_str);
 }
 
 void loop()
@@ -209,7 +251,7 @@ void loop()
     long now = millis();
 
     int value = analogRead(soundPin);//read the value of A0
-    Serial.println(value);
+    
     averageValueNoise = averageValueNoise * 0.95 + value * 0.05;
     delay(100);
   
@@ -223,8 +265,13 @@ void loop()
       temp();
       lastMsgTemp = now;
     }
+
+    if (now - lastMsgCO2 > 26000) {
+      co2();
+      lastMsgCO2 = now;
+    }
   
-    if (now - lastMsgLux > 23000) {
+    if (now - lastMsgLux > 10000) {
       lux();
       lastMsgLux = now;
     }
